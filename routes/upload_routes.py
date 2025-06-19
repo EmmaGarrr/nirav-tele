@@ -44,7 +44,7 @@ ApiResult = Tuple[bool, str, Optional[Dict[str, Any]]]
 upload_bp = Blueprint('upload', __name__)
 
 
-# --- Helper Functions (unchanged) ---
+# --- Helper Functions (unchanged) --------------------------------------------------
 
 def _parse_send_results(log_prefix: str, send_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     all_chat_details: List[Dict[str, Any]] = []
@@ -74,11 +74,13 @@ def _parse_send_results(log_prefix: str, send_results: List[Dict[str, Any]]) -> 
         all_chat_details.append(detail)
     return all_chat_details
 
+
 def _send_single_file_task(
     file_path: str, filename: str, chat_id: str, upload_id: str
 ) -> Tuple[str, ApiResult]:
     with open(file_path, 'rb') as f:
         return str(chat_id), send_file_to_telegram(f, filename, chat_id)
+
 
 def _send_chunk_task(
     chunk_data: bytes, filename: str, chat_id: str, upload_id: str, chunk_num: int
@@ -88,11 +90,11 @@ def _send_chunk_task(
         return str(chat_id), send_file_to_telegram(buf, filename, chat_id)
 
 
-# --- API Routes ---
+# --- API Routes --------------------------------------------------------------------
 
 @upload_bp.route('/progress-stream/<batch_id>', methods=['GET'])
 def stream_upload_progress(batch_id: str):
-    """SSE for upload/transfer progress (with heartbeats)."""
+    """Server-sent events channel for upload progress."""
     def generate_events():
         last_data = None
         log_prefix = f"[ProgressStream-{batch_id}]"
@@ -162,6 +164,9 @@ def initiate_batch_upload():
     return jsonify({"message": "Batch initiated", "batch_id": batch_id}), 201
 
 
+# -------------------------------------------------------------------------
+#   STREAM FILE TO BATCH  (*** REFACTORED TO AVOID StopIteration ERROR ***)
+# -------------------------------------------------------------------------
 @upload_bp.route('/stream', methods=['POST', 'OPTIONS'])
 @jwt_required(optional=True)
 def stream_file_to_batch():
@@ -172,6 +177,7 @@ def stream_file_to_batch():
     if request.method == 'OPTIONS':
         return make_response(("OK", 200))
 
+    # --- 1) Basic param / header validation --------------------------------
     batch_id = request.args.get('batch_id')
     if not batch_id:
         return jsonify({"error": "Missing 'batch_id' param"}), 400
@@ -189,30 +195,36 @@ def stream_file_to_batch():
         return jsonify({"error": "Invalid 'X-Filesize' header"}), 400
 
     log_prefix = f"[StreamForBatch-{batch_id}]"
-    gdrive_id = None
+    gdrive_id: Optional[str] = None  # may be set later
 
+    # --- 2) Main processing -------------------------------------------------
     try:
+        # 2-a) Build stream wrapper & generator
         wrapper = StreamReaderWrapper(request.stream, total_size)
-        logging.info(f"{log_prefix} Streaming '{filename}' ({format_bytes(total_size)})")
-
         gen = upload_to_gdrive_with_progress(
             source=wrapper,
             filename_in_gdrive=filename,
             operation_id_for_log=batch_id
         )
 
-        # relay progress
-        for evt in gen:
-            evt["filename"] = filename
-            upload_progress_data[batch_id] = evt
-        # StopIteration returns final value
-        gdrive_id, err = gen.send(None)
-        logging.info(f"{log_prefix} Upload done ID={gdrive_id} err={err}")
+        err: Optional[str] = None
 
+        # 2-b) Consume progress events safely and capture final return value
+        try:
+            for evt in gen:
+                evt["filename"] = filename
+                upload_progress_data[batch_id] = evt
+        except StopIteration as e:
+            # generator finished; unpack its return
+            gdrive_id, err = e.value  # type: ignore[attr-defined]
+
+        # 2-c) Validate result
         if err or not gdrive_id:
-            raise Exception(err or "No Drive ID")
+            raise Exception(err or "No Drive ID returned from upload generator")
 
-        # Save metadata
+        logging.info(f"{log_prefix} Upload finished. Drive ID = {gdrive_id}")
+
+        # --- 3) Update metadata in DB ---------------------------------------
         details = {
             "original_filename": filename,
             "gdrive_file_id": gdrive_id,
@@ -223,24 +235,27 @@ def stream_file_to_batch():
         coll, db_err = get_metadata_collection()
         if db_err:
             raise Exception(db_err)
+
         res = coll.update_one(
             {"access_id": batch_id},
             {"$push": {"files_in_batch": details}}
         )
         if res.matched_count == 0:
+            # batch disappeared – roll back
             delete_from_gdrive(gdrive_id)
-            raise Exception("Batch ID not found")
+            raise Exception("Batch ID not found while saving metadata")
 
     except Exception as ex:
+        # ----- Error handling & cleanup -------------------------------------
         if gdrive_id:
             delete_from_gdrive(gdrive_id)
         logging.error(f"{log_prefix} Error: {ex}", exc_info=True)
         upload_progress_data[batch_id] = {"type": "error", "message": str(ex)}
         return jsonify({"error": str(ex)}), 500
 
+    # --- 4) Success response ------------------------------------------------
     upload_progress_data[batch_id] = {"type": "status", "message": f"Completed: {filename}"}
     return jsonify({"message": f"'{filename}' uploaded to GDrive"}), 200
-
 
 @upload_bp.route('/finalize-batch/<batch_id>', methods=['POST'])
 @jwt_required(optional=True)
