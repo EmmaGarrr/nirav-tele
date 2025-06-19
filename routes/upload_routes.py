@@ -33,7 +33,7 @@ from google_drive_api import (
 )
 from .utils import _yield_sse_event, _safe_remove_file
 
-# --- Blueprint and Global Setup ---
+# --- Blueprint and Global Setup ---------------------------------------------------
 
 telegram_transfer_executor = ThreadPoolExecutor(
     max_workers=MAX_UPLOAD_WORKERS,
@@ -44,7 +44,7 @@ ApiResult = Tuple[bool, str, Optional[Dict[str, Any]]]
 upload_bp = Blueprint('upload', __name__)
 
 
-# --- Helper Functions (unchanged) --------------------------------------------------
+# --- Helper Functions (unchanged) -------------------------------------------------
 
 def _parse_send_results(log_prefix: str, send_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     all_chat_details: List[Dict[str, Any]] = []
@@ -90,7 +90,7 @@ def _send_chunk_task(
         return str(chat_id), send_file_to_telegram(buf, filename, chat_id)
 
 
-# --- API Routes --------------------------------------------------------------------
+# --- API Routes -------------------------------------------------------------------
 
 @upload_bp.route('/progress-stream/<batch_id>', methods=['GET'])
 def stream_upload_progress(batch_id: str):
@@ -164,9 +164,9 @@ def initiate_batch_upload():
     return jsonify({"message": "Batch initiated", "batch_id": batch_id}), 201
 
 
-# -------------------------------------------------------------------------
-#   STREAM FILE TO BATCH  (*** REFACTORED TO AVOID StopIteration ERROR ***)
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+#   STREAM FILE TO BATCH  (*** LOGIC FIX FOR GENERATOR RETURN CAPTURE ***)
+# -----------------------------------------------------------------------------
 @upload_bp.route('/stream', methods=['POST', 'OPTIONS'])
 @jwt_required(optional=True)
 def stream_file_to_batch():
@@ -177,7 +177,7 @@ def stream_file_to_batch():
     if request.method == 'OPTIONS':
         return make_response(("OK", 200))
 
-    # --- 1) Basic param / header validation --------------------------------
+    # --- 1) Basic param / header validation ---------------------------------
     batch_id = request.args.get('batch_id')
     if not batch_id:
         return jsonify({"error": "Missing 'batch_id' param"}), 400
@@ -195,11 +195,11 @@ def stream_file_to_batch():
         return jsonify({"error": "Invalid 'X-Filesize' header"}), 400
 
     log_prefix = f"[StreamForBatch-{batch_id}]"
-    gdrive_id: Optional[str] = None  # may be set later
+    gdrive_id: Optional[str] = None  # will be filled later
 
-    # --- 2) Main processing -------------------------------------------------
+    # --- 2) Main processing --------------------------------------------------
     try:
-        # 2-a) Build stream wrapper & generator
+        # 2-a) Build wrapper & generator
         wrapper = StreamReaderWrapper(request.stream, total_size)
         gen = upload_to_gdrive_with_progress(
             source=wrapper,
@@ -207,16 +207,17 @@ def stream_file_to_batch():
             operation_id_for_log=batch_id
         )
 
-        err: Optional[str] = None
+        err: Optional[str] = None  # initialize for later
 
-        # 2-b) Consume progress events safely and capture final return value
-        try:
-            for evt in gen:
+        # 2-b) Manually drive generator so we catch StopIteration ourselves
+        while True:
+            try:
+                evt = next(gen)              # may raise StopIteration
                 evt["filename"] = filename
                 upload_progress_data[batch_id] = evt
-        except StopIteration as e:
-            # generator finished; unpack its return
-            gdrive_id, err = e.value  # type: ignore[attr-defined]
+            except StopIteration as e:
+                gdrive_id, err = e.value      # type: ignore[attr-defined]
+                break
 
         # 2-c) Validate result
         if err or not gdrive_id:
@@ -224,7 +225,7 @@ def stream_file_to_batch():
 
         logging.info(f"{log_prefix} Upload finished. Drive ID = {gdrive_id}")
 
-        # --- 3) Update metadata in DB ---------------------------------------
+        # --- 3) Save metadata ------------------------------------------------
         details = {
             "original_filename": filename,
             "gdrive_file_id": gdrive_id,
@@ -241,22 +242,55 @@ def stream_file_to_batch():
             {"$push": {"files_in_batch": details}}
         )
         if res.matched_count == 0:
-            # batch disappeared – roll back
             delete_from_gdrive(gdrive_id)
             raise Exception("Batch ID not found while saving metadata")
 
     except Exception as ex:
-        # ----- Error handling & cleanup -------------------------------------
+        # -------- Error handling & cleanup -----------------------------------
         if gdrive_id:
             delete_from_gdrive(gdrive_id)
         logging.error(f"{log_prefix} Error: {ex}", exc_info=True)
         upload_progress_data[batch_id] = {"type": "error", "message": str(ex)}
         return jsonify({"error": str(ex)}), 500
 
-    # --- 4) Success response ------------------------------------------------
+    # --- 4) Success response -------------------------------------------------
     upload_progress_data[batch_id] = {"type": "status", "message": f"Completed: {filename}"}
     return jsonify({"message": f"'{filename}' uploaded to GDrive"}), 200
 
+
+# -----------------------------------------------------------------------------
+#   FINALIZE BATCH (unchanged)
+# -----------------------------------------------------------------------------
+@upload_bp.route('/finalize-batch/<batch_id>', methods=['POST'])
+@jwt_required(optional=True)
+def finalize_batch_upload(batch_id: str):
+    log_prefix = f"[BatchFinalize-{batch_id}]"
+    upload_progress_data[batch_id] = {"type": "finalized", "message": "Starting Telegram transfer"}
+    coll, err = get_metadata_collection()
+    if err:
+        return jsonify({"error": "DB error"}), 500
+    upd = coll.update_one(
+        {"access_id": batch_id},
+        {"$set": {"status_overall": "gdrive_complete_pending_telegram"}}
+    )
+    if upd.matched_count == 0:
+        return jsonify({"error": "Batch not found"}), 404
+
+    logging.info(f"{log_prefix} Submitting background Telegram transfer")
+    telegram_transfer_executor.submit(run_gdrive_to_telegram_transfer, batch_id)
+
+    base = os.environ.get('FRONTEND_URL', '').rstrip('/')
+    download_url = f"{base}/batch-view/{batch_id}"
+    return jsonify({
+        "message": "Batch finalized",
+        "access_id": batch_id,
+        "download_url": download_url
+    }), 202
+
+
+# -----------------------------------------------------------------------------
+#   FINALIZE BATCH (unchanged)
+# -----------------------------------------------------------------------------
 @upload_bp.route('/finalize-batch/<batch_id>', methods=['POST'])
 @jwt_required(optional=True)
 def finalize_batch_upload(batch_id: str):
