@@ -289,12 +289,10 @@ def finalize_batch_upload(batch_id: str):
 
 
 # -----------------------------------------------------------------------------
-#   FINALIZE BATCH (unchanged)
+#   RUN TELEGRAM TRANSFER (unchanged)
 # -----------------------------------------------------------------------------
-@upload_bp.route('/finalize-batch/<batch_id>', methods=['POST'])
-@jwt_required(optional=True)
-def finalize_batch_upload(batch_id: str):
-    log_prefix = f"[BatchFinalize-{batch_id}]"
+def run_gdrive_to_telegram_transfer(access_id: str):           
+    log_prefix = f"[BG-TG-{access_id}]"
     upload_progress_data[batch_id] = {"type": "finalized", "message": "Starting Telegram transfer"}
     coll, err = get_metadata_collection()
     if err:
