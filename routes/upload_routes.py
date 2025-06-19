@@ -29,7 +29,8 @@ from google_drive_api import (
     StreamReaderWrapper,
     delete_from_gdrive,
     upload_to_gdrive_with_progress,
-    download_from_gdrive_to_file
+    download_from_gdrive_to_file,
+    initiate_resumable_gdrive_session          # <-- NEW IMPORT
 )
 from .utils import _yield_sse_event, _safe_remove_file
 
@@ -90,8 +91,49 @@ def _send_chunk_task(
         return str(chat_id), send_file_to_telegram(buf, filename, chat_id)
 
 
-# --- API Routes -------------------------------------------------------------------
+# =============================================================================
+#   NEW ENDPOINT – initiate Google-Drive resumable session
+# =============================================================================
+@upload_bp.route('/initiate-gdrive-session', methods=['POST', 'OPTIONS'])
+@jwt_required(optional=True)
+def initiate_gdrive_session():
+    """
+    Front-end calls this first to obtain a Google Drive resumable-upload
+    session URI.  The caller then uploads file data directly to that URI.
+    """
+    if request.method == 'OPTIONS':
+        return make_response(("OK", 200))
 
+    data = request.get_json() or {}
+    filename = data.get("filename")
+    filesize = data.get("filesize")
+    mimetype = data.get("mimetype")
+
+    # --- basic validation ---------------------------------------------------
+    if not filename or filesize is None or not mimetype:
+        return jsonify({"error": "Required fields: filename, filesize, mimetype"}), 400
+    try:
+        filesize_int = int(filesize)
+    except ValueError:
+        return jsonify({"error": "'filesize' must be an integer"}), 400
+
+    # --- call helper --------------------------------------------------------
+    session_uri, err = initiate_resumable_gdrive_session(
+        filename=filename,
+        filesize=filesize_int,
+        mimetype=mimetype
+    )
+
+    if err or not session_uri:
+        logging.error(f"[InitGDriveSession] Error: {err}")
+        return jsonify({"error": err or "Unable to create Drive session"}), 500
+
+    return jsonify({"session_uri": session_uri}), 200
+
+
+# =============================================================================
+#   PROGRESS SSE CHANNEL (unchanged)
+# =============================================================================
 @upload_bp.route('/progress-stream/<batch_id>', methods=['GET'])
 def stream_upload_progress(batch_id: str):
     """Server-sent events channel for upload progress."""
@@ -165,7 +207,7 @@ def initiate_batch_upload():
 
 
 # -----------------------------------------------------------------------------
-#   STREAM FILE TO BATCH  (*** LOGIC FIX FOR GENERATOR RETURN CAPTURE ***)
+#   STREAM FILE TO BATCH  (logic fixed to capture generator return)
 # -----------------------------------------------------------------------------
 @upload_bp.route('/stream', methods=['POST', 'OPTIONS'])
 @jwt_required(optional=True)
@@ -293,31 +335,6 @@ def finalize_batch_upload(batch_id: str):
 # -----------------------------------------------------------------------------
 def run_gdrive_to_telegram_transfer(access_id: str):           
     log_prefix = f"[BG-TG-{access_id}]"
-    upload_progress_data[batch_id] = {"type": "finalized", "message": "Starting Telegram transfer"}
-    coll, err = get_metadata_collection()
-    if err:
-        return jsonify({"error": "DB error"}), 500
-    upd = coll.update_one(
-        {"access_id": batch_id},
-        {"$set": {"status_overall": "gdrive_complete_pending_telegram"}}
-    )
-    if upd.matched_count == 0:
-        return jsonify({"error": "Batch not found"}), 404
-
-    logging.info(f"{log_prefix} Submitting background Telegram transfer")
-    telegram_transfer_executor.submit(run_gdrive_to_telegram_transfer, batch_id)
-
-    base = os.environ.get('FRONTEND_URL', '').rstrip('/')
-    download_url = f"{base}/batch-view/{batch_id}"
-    return jsonify({
-        "message": "Batch finalized",
-        "access_id": batch_id,
-        "download_url": download_url
-    }), 202
-
-
-def run_gdrive_to_telegram_transfer(access_id: str):
-    log_prefix = f"[BG-TG-{access_id}]"
     logging.info(f"{log_prefix} Starting background transfer")
     record, err = find_metadata_by_access_id(access_id)
     if err or not record:
@@ -347,7 +364,6 @@ def run_gdrive_to_telegram_transfer(access_id: str):
                 try:
                     # download to temp
                     import tempfile
-                    import os
                     suffix = os.path.splitext(fname)[1]
                     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
                         temp_path = tmp.name
@@ -444,7 +460,6 @@ def run_gdrive_to_telegram_transfer(access_id: str):
         record["status_overall"] = "error_bg"
         record["last_error"] = str(bg_ex)
         save_file_metadata(record)
-
 
 @upload_bp.route('/stream-legacy', methods=['POST', 'OPTIONS'])
 @jwt_required(optional=True)

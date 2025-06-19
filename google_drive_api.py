@@ -8,8 +8,10 @@
 
 import os
 import io
+import json               # NEW
 import logging
 import mimetypes
+import requests           # NEW
 from typing import Optional, Tuple, Generator, Dict, Any, Union
 
 from dotenv import load_dotenv
@@ -40,14 +42,14 @@ class StreamReaderWrapper:
         self.stream_len = stream_len
         self._bytes_read = 0
 
-    # --- Required read interface ------------------------------------------------
+    # --- Required read interface ---------------------------------------------
     def read(self, size: int = -1) -> bytes:
         data = self.stream_obj.read(size)
         read_len = len(data) if data else 0
         self._bytes_read += read_len
         return data
 
-    # --- Size helpers -----------------------------------------------------------
+    # --- Size helpers ---------------------------------------------------------
     def __len__(self) -> int:
         return self.stream_len
 
@@ -55,20 +57,13 @@ class StreamReaderWrapper:
         """Return bytes already read (for progress calculations)."""
         return self._bytes_read
 
-    # --- New methods for IOBase compatibility -----------------------------------
+    # --- New IOBase-compat methods -------------------------------------------
     def seekable(self) -> bool:
-        """
-        Explicitly advertise that this stream is *not* seekable.  The Drive
-        client checks this in some code-paths.
-        """
+        """Return False — this stream cannot seek."""
         return False
 
     def seek(self, offset: int, whence: int = 0) -> int:  # noqa: D401, E251
-        """
-        Dummy no-op seeker.  Google’s library may still call seek() on a
-        non-seekable object; we ignore the request and report position 0 so
-        that it doesn’t crash with AttributeError.
-        """
+        """No-op seek; always return 0 so the caller doesn’t crash."""
         return 0
 
 # ---------------------------------------------------------------------------
@@ -76,7 +71,7 @@ class StreamReaderWrapper:
 # ---------------------------------------------------------------------------
 load_dotenv()
 
-GDRIVE_CLIENT_ID = os.getenv("GDRIVE_CLIENT_ID")
+GDRIVE_CLIENT_ID     = os.getenv("GDRIVE_CLIENT_ID")
 GDRIVE_CLIENT_SECRET = os.getenv("GDRIVE_CLIENT_SECRET")
 GDRIVE_REFRESH_TOKEN = os.getenv("GDRIVE_REFRESH_TOKEN")
 
@@ -102,8 +97,11 @@ def upload_to_gdrive_with_progress(
     """
     Upload *source* into your Drive and yield progress dictionaries.
 
-    Returns final tuple (drive_file_id, error_message).  If error_message is
-    None, the upload succeeded.
+    Yields:
+        {"type": "progress", ...} dicts while uploading.
+
+    Returns:
+        (drive_file_id, error_message) as generator final value.
     """
     log_prefix = f"[GDriveUpload-{operation_id_for_log}-{filename_in_gdrive[:20]}]"
 
@@ -113,7 +111,7 @@ def upload_to_gdrive_with_progress(
         if DRIVE_TEMP_FOLDER_ID:
             file_metadata["parents"] = [DRIVE_TEMP_FOLDER_ID]
 
-        media_body = None
+        media_body: Optional[MediaIoBaseUpload] = None
         file_size = 0
 
         # Local file path -------------------------------------------------------
@@ -218,6 +216,83 @@ def upload_to_gdrive_with_progress(
         yield {"type": "error", "message": err}
         return None, err
 
+
+# ---------------------------------------------------------------------------
+# NEW HELPER – initiate resumable session
+# ---------------------------------------------------------------------------
+
+def initiate_resumable_gdrive_session(
+    filename: str,
+    filesize: int,
+    mimetype: str
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Start a resumable-upload session and return the session URI.
+
+    Args:
+        filename:  Desired name in Drive.
+        filesize:  Size in bytes.
+        mimetype:  Mime-type string.
+
+    Returns:
+        (session_uri, error_message).  If error_message is None, success.
+    """
+    log_prefix = f"[GDrive-Resumable-Session-{filename[:20]}]"
+    try:
+        service = _get_drive_service()
+    except Exception as e:
+        err = f"Auth error obtaining Drive service: {e}"
+        logging.error(f"{log_prefix} {err}")
+        return None, err
+
+    # Ensure we have an access token
+    access_token: Optional[str] = getattr(service._http.credentials, "token", None)
+    if not access_token:
+        try:
+            service._http.credentials.refresh(httplib2.Http())
+            access_token = service._http.credentials.token
+        except Exception as e:
+            err = f"Could not refresh OAuth token: {e}"
+            logging.error(f"{log_prefix} {err}")
+            return None, err
+
+    url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable"
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json; charset=UTF-8",
+        "X-Upload-Content-Type": mimetype,
+        "X-Upload-Content-Length": str(filesize),
+    }
+
+    body = {"name": filename}
+    if DRIVE_TEMP_FOLDER_ID:
+        body["parents"] = [DRIVE_TEMP_FOLDER_ID]
+
+    try:
+        resp = requests.post(url, headers=headers, data=json.dumps(body), timeout=30)
+    except requests.RequestException as e:
+        err = f"Network error contacting Google Drive: {e}"
+        logging.error(f"{log_prefix} {err}")
+        return None, err
+
+    if resp.status_code == 200:
+        session_uri = resp.headers.get("Location")
+        if session_uri:
+            logging.info(f"{log_prefix} Session URI created.")
+            return session_uri, None
+        err = "Resumable session started but no Location header returned."
+        logging.error(f"{log_prefix} {err}")
+        return None, err
+
+    err = (f"Google Drive resumable-session request failed "
+           f"({resp.status_code}): {resp.text}")
+    logging.error(f"{log_prefix} {err}")
+    return None, err
+
+# ---------------------------------------------------------------------------
+# Other public helpers
+# ---------------------------------------------------------------------------
 
 def download_from_gdrive(gid: str) -> Tuple[Optional[io.BytesIO], Optional[str]]:
     """Download a file by ID from Drive into memory."""
