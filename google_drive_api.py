@@ -28,23 +28,48 @@ import httplib2
 # Stream wrapper for non-seekable inputs
 # ---------------------------------------------------------------------------
 class StreamReaderWrapper:
-    """Wrap a non-seekable stream and expose read, __len__, and tell."""
+    """
+    Wrap a non-seekable stream (e.g. Flask request.stream) so that it presents
+    the minimal IO interface google-api-python-client expects.  We expose
+    read(), __len__(), tell(), seekable() and a *dummy* seek().  The client
+    library still probes for seek() even when we declare the stream as
+    non-seekable; returning 0 prevents AttributeError crashes.
+    """
     def __init__(self, stream_obj, stream_len: int):
         self.stream_obj = stream_obj
         self.stream_len = stream_len
         self._bytes_read = 0
 
+    # --- Required read interface ------------------------------------------------
     def read(self, size: int = -1) -> bytes:
         data = self.stream_obj.read(size)
         read_len = len(data) if data else 0
         self._bytes_read += read_len
         return data
 
+    # --- Size helpers -----------------------------------------------------------
     def __len__(self) -> int:
         return self.stream_len
 
     def tell(self) -> int:
+        """Return bytes already read (for progress calculations)."""
         return self._bytes_read
+
+    # --- New methods for IOBase compatibility -----------------------------------
+    def seekable(self) -> bool:
+        """
+        Explicitly advertise that this stream is *not* seekable.  The Drive
+        client checks this in some code-paths.
+        """
+        return False
+
+    def seek(self, offset: int, whence: int = 0) -> int:  # noqa: D401, E251
+        """
+        Dummy no-op seeker.  Google’s library may still call seek() on a
+        non-seekable object; we ignore the request and report position 0 so
+        that it doesn’t crash with AttributeError.
+        """
+        return 0
 
 # ---------------------------------------------------------------------------
 # Environment & constants
@@ -55,13 +80,13 @@ GDRIVE_CLIENT_ID = os.getenv("GDRIVE_CLIENT_ID")
 GDRIVE_CLIENT_SECRET = os.getenv("GDRIVE_CLIENT_SECRET")
 GDRIVE_REFRESH_TOKEN = os.getenv("GDRIVE_REFRESH_TOKEN")
 
-DRIVE_TEMP_FOLDER_ID = os.getenv("GDRIVE_TEMP_FOLDER_ID")  # optional target folder
+DRIVE_TEMP_FOLDER_ID = os.getenv("GDRIVE_TEMP_FOLDER_ID")  # optional upload folder
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
-ONE_MB = 8 * 1024 * 1024
+ONE_MB = 8 * 1024 * 1024  # 8 MiB chunk size for resumable uploads
 
 try:
-    from extensions import upload_progress_data  # noqa: F401  (optional)
+    from extensions import upload_progress_data  # optional global store
 except ImportError:
     pass
 
@@ -74,8 +99,12 @@ def upload_to_gdrive_with_progress(
     filename_in_gdrive: str,
     operation_id_for_log: str,
 ) -> Generator[Dict[str, Any], None, Tuple[Optional[str], Optional[str]]]:
-    """Upload *source* into your Drive with progress events."""
+    """
+    Upload *source* into your Drive and yield progress dictionaries.
 
+    Returns final tuple (drive_file_id, error_message).  If error_message is
+    None, the upload succeeded.
+    """
     log_prefix = f"[GDriveUpload-{operation_id_for_log}-{filename_in_gdrive[:20]}]"
 
     try:
@@ -87,7 +116,7 @@ def upload_to_gdrive_with_progress(
         media_body = None
         file_size = 0
 
-        # File path
+        # Local file path -------------------------------------------------------
         if isinstance(source, str) and os.path.exists(source):
             file_size = os.path.getsize(source)
             media_body = MediaFileUpload(
@@ -97,7 +126,7 @@ def upload_to_gdrive_with_progress(
                 resumable=True,
                 chunksize=ONE_MB,
             )
-        # In-memory buffer
+        # In-memory buffer ------------------------------------------------------
         elif isinstance(source, io.BytesIO):
             source.seek(0, io.SEEK_END)
             file_size = source.tell()
@@ -109,7 +138,7 @@ def upload_to_gdrive_with_progress(
                 resumable=True,
                 chunksize=ONE_MB,
             )
-        # Stream wrapper
+        # Wrapped request stream -----------------------------------------------
         elif isinstance(source, StreamReaderWrapper):
             file_size = len(source)
             media_body = MediaIoBaseUpload(
@@ -120,12 +149,13 @@ def upload_to_gdrive_with_progress(
                 chunksize=ONE_MB,
             )
         else:
-            err = "Invalid source type for GDrive upload. Must be a file path, io.BytesIO, or StreamReaderWrapper."
+            err = ("Invalid source type for GDrive upload. Must be a file path, "
+                   "io.BytesIO, or StreamReaderWrapper.")
             logging.error(f"{log_prefix} {err}")
             yield {"type": "error", "message": err}
             return None, err
 
-        # Edge-case: zero-byte placeholder
+        # Edge-case: zero-byte placeholder -------------------------------------
         if file_size == 0:
             empty = service.files().create(body=file_metadata, fields="id").execute()
             gid = empty.get("id")
@@ -136,6 +166,7 @@ def upload_to_gdrive_with_progress(
             yield {"type": "error", "message": err}
             return None, err
 
+        # Resumable upload loop -------------------------------------------------
         request = service.files().create(
             body=file_metadata,
             media_body=media_body,
@@ -189,7 +220,7 @@ def upload_to_gdrive_with_progress(
 
 
 def download_from_gdrive(gid: str) -> Tuple[Optional[io.BytesIO], Optional[str]]:
-    """Download a file by ID from Drive."""
+    """Download a file by ID from Drive into memory."""
     try:
         service = _get_drive_service()
         request = service.files().get_media(fileId=gid)
@@ -230,7 +261,7 @@ def delete_from_gdrive(gid: str) -> Tuple[bool, Optional[str]]:
 def _get_drive_service():
     """Return a Drive service authenticated with user-refresh token."""
     if not (GDRIVE_CLIENT_ID and GDRIVE_CLIENT_SECRET and GDRIVE_REFRESH_TOKEN):
-        raise ValueError("OAuth env vars missing (CLIENT_ID/SECRET/REFRESH_TOKEN).")
+        raise ValueError("OAuth env vars missing (CLIENT_ID / SECRET / REFRESH_TOKEN).")
 
     creds = Credentials(
         token=None,
@@ -250,13 +281,16 @@ def _get_drive_service():
 
 logging.info("Google Drive API module loaded – OAuth user mode.")
 
-# ADDITIONAL DOWNLOAD HELPER
+# ---------------------------------------------------------------------------
+# Additional helper – direct download to file path
+# ---------------------------------------------------------------------------
+
 def download_from_gdrive_to_file(gid: str, destination_path: str) -> Tuple[bool, Optional[str]]:
-    """Downloads a file by ID from Drive directly to a file path."""
+    """Download Drive file directly to *destination_path*."""
     try:
         service = _get_drive_service()
         request = service.files().get_media(fileId=gid)
-        
+
         with open(destination_path, "wb") as fh:
             downloader = MediaIoBaseDownload(fh, request)
             done = False
@@ -264,7 +298,7 @@ def download_from_gdrive_to_file(gid: str, destination_path: str) -> Tuple[bool,
                 status, done = downloader.next_chunk()
                 if status:
                     logging.info(f"Download to file {gid}: {int(status.progress() * 100)}%")
-        
+
         return True, None
     except HttpError as e:
         if e.resp.status == 404:
