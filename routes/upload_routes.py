@@ -30,30 +30,27 @@ from google_drive_api import (
     delete_from_gdrive,
     upload_to_gdrive_with_progress,
     download_from_gdrive_to_file,
-    initiate_resumable_gdrive_session          # <-- NEW IMPORT
+    initiate_resumable_gdrive_session              # NEW
 )
 from .utils import _yield_sse_event, _safe_remove_file
 
-# --- Blueprint and Global Setup ---------------------------------------------------
-
+# ---------------------------------------------------------------------------
+# Blueprint / thread-pool setup
+# ---------------------------------------------------------------------------
 telegram_transfer_executor = ThreadPoolExecutor(
     max_workers=MAX_UPLOAD_WORKERS,
     thread_name_prefix='BgTgTransfer'
 )
-
 ApiResult = Tuple[bool, str, Optional[Dict[str, Any]]]
 upload_bp = Blueprint('upload', __name__)
 
-
-# --- Helper Functions (unchanged) -------------------------------------------------
-
+# ---------------------------------------------------------------------------
+# Helpers (unchanged)
+# ---------------------------------------------------------------------------
 def _parse_send_results(log_prefix: str, send_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     all_chat_details: List[Dict[str, Any]] = []
     for res in send_results:
-        detail: Dict[str, Any] = {
-            "chat_id": res["chat_id"],
-            "success": res["success"]
-        }
+        detail: Dict[str, Any] = {"chat_id": res["chat_id"], "success": res["success"]}
         if res["success"] and res.get("tg_response"):
             r = res["tg_response"].get('result', {})
             msg_id = r.get('message_id')
@@ -62,7 +59,7 @@ def _parse_send_results(log_prefix: str, send_results: List[Dict[str, Any]]) -> 
             if msg_id and f_id and f_uid:
                 detail.update({
                     "message_id": msg_id,
-                    "file_id": f_id,
+                    "file_id":      f_id,
                     "file_unique_id": f_uid
                 })
                 size = r.get('document', {}).get('file_size')
@@ -76,48 +73,39 @@ def _parse_send_results(log_prefix: str, send_results: List[Dict[str, Any]]) -> 
     return all_chat_details
 
 
-def _send_single_file_task(
-    file_path: str, filename: str, chat_id: str, upload_id: str
-) -> Tuple[str, ApiResult]:
+def _send_single_file_task(file_path: str, filename: str, chat_id: str, upload_id: str) -> Tuple[str, ApiResult]:
     with open(file_path, 'rb') as f:
         return str(chat_id), send_file_to_telegram(f, filename, chat_id)
 
 
-def _send_chunk_task(
-    chunk_data: bytes, filename: str, chat_id: str, upload_id: str, chunk_num: int
-) -> Tuple[str, ApiResult]:
+def _send_chunk_task(chunk_data: bytes, filename: str, chat_id: str, upload_id: str, chunk_num: int) -> Tuple[str, ApiResult]:
     import io
     with io.BytesIO(chunk_data) as buf:
         return str(chat_id), send_file_to_telegram(buf, filename, chat_id)
 
 
-# =============================================================================
-#   NEW ENDPOINT – initiate Google-Drive resumable session
-# =============================================================================
+# ============================================================================
+#  NEW 1/3  –  Initiate Google-Drive Resumable Session
+# ============================================================================
 @upload_bp.route('/initiate-gdrive-session', methods=['POST', 'OPTIONS'])
 @jwt_required(optional=True)
 def initiate_gdrive_session():
-    """
-    Front-end calls this first to obtain a Google Drive resumable-upload
-    session URI.  The caller then uploads file data directly to that URI.
-    """
+    """Front-end obtains a Drive resumable-upload session URI."""
     if request.method == 'OPTIONS':
         return make_response(("OK", 200))
 
     data = request.get_json() or {}
-    filename = data.get("filename")
-    filesize = data.get("filesize")
-    mimetype = data.get("mimetype")
+    filename  = data.get("filename")
+    filesize  = data.get("filesize")
+    mimetype  = data.get("mimetype")
 
-    # --- basic validation ---------------------------------------------------
     if not filename or filesize is None or not mimetype:
-        return jsonify({"error": "Required fields: filename, filesize, mimetype"}), 400
+        return jsonify({"error": "Required: filename, filesize, mimetype"}), 400
     try:
         filesize_int = int(filesize)
     except ValueError:
-        return jsonify({"error": "'filesize' must be an integer"}), 400
+        return jsonify({"error": "'filesize' must be integer"}), 400
 
-    # --- call helper --------------------------------------------------------
     session_uri, err = initiate_resumable_gdrive_session(
         filename=filename,
         filesize=filesize_int,
@@ -125,32 +113,86 @@ def initiate_gdrive_session():
     )
 
     if err or not session_uri:
-        logging.error(f"[InitGDriveSession] Error: {err}")
-        return jsonify({"error": err or "Unable to create Drive session"}), 500
+        logging.error(f"[InitGDriveSession] {err}")
+        return jsonify({"error": err or "Failed to create Drive session"}), 500
 
     return jsonify({"session_uri": session_uri}), 200
 
 
-# =============================================================================
-#   PROGRESS SSE CHANNEL (unchanged)
-# =============================================================================
+# ============================================================================
+#  NEW 2/3  –  Register a completed direct-to-Drive upload
+# ============================================================================
+@upload_bp.route('/register-gdrive-upload', methods=['POST'])
+@jwt_required(optional=True)
+def register_gdrive_upload():
+    """
+    Front-end calls this *after* uploading file data directly to Google Drive
+    (using the session URI).  We persist metadata so the file appears in the
+    batch and can later be pushed to Telegram.
+    """
+    data = request.get_json() or {}
+    batch_id          = data.get("batch_id")
+    gdrive_file_id    = data.get("gdrive_file_id")
+    original_filename = data.get("original_filename")
+    original_size     = data.get("original_size")
+
+    if not all([batch_id, gdrive_file_id, original_filename, original_size]):
+        return jsonify({"error": "Fields required: batch_id, gdrive_file_id, original_filename, original_size"}), 400
+
+    # ensure size is an int
+    try:
+        original_size_int = int(original_size)
+    except ValueError:
+        return jsonify({"error": "'original_size' must be integer"}), 400
+
+    # fetch batch
+    record, err = find_metadata_by_access_id(batch_id)
+    if err or record is None:
+        return jsonify({"error": "Batch not found"}), 404
+
+    # create file details in our canonical schema
+    file_details = {
+        "original_filename": original_filename,
+        "gdrive_file_id":    gdrive_file_id,
+        "original_size":     original_size_int,
+        "mime_type": mimetypes.guess_type(original_filename)[0] or "application/octet-stream",
+        "telegram_send_status": "pending"
+    }
+
+    coll, db_err = get_metadata_collection()
+    if db_err:
+        return jsonify({"error": "DB error"}), 500
+
+    upd = coll.update_one(
+        {"access_id": batch_id},
+        {"$push": {"files_in_batch": file_details}}
+    )
+    if upd.matched_count == 0:
+        return jsonify({"error": "Batch not found"}), 404
+
+    logging.info(f"[RegisterUpload] Added file to batch {batch_id}: {original_filename}")
+    return jsonify({"message": "File registered successfully"}), 200
+
+
+# ============================================================================
+#  PROGRESS SSE  (unchanged)
+# ============================================================================
 @upload_bp.route('/progress-stream/<batch_id>', methods=['GET'])
 def stream_upload_progress(batch_id: str):
-    """Server-sent events channel for upload progress."""
+    """SSE for real-time upload progress."""
     def generate_events():
         last_data = None
         log_prefix = f"[ProgressStream-{batch_id}]"
         logging.info(f"{log_prefix} SSE opened.")
         last_hb = time.time()
-        hb_int = 15
-
+        hb_int  = 15
         try:
             while True:
                 evt = upload_progress_data.get(batch_id)
                 if evt and evt != last_data:
                     yield _yield_sse_event(evt.get("type", "status"), evt)
                     last_data = evt
-                    last_hb = time.time()
+                    last_hb   = time.time()
                     if evt.get("type") in ("complete", "error", "finalized"):
                         break
                 if time.time() - last_hb > hb_int:
@@ -162,15 +204,19 @@ def stream_upload_progress(batch_id: str):
     return Response(stream_with_context(generate_events()), mimetype='text/event-stream')
 
 
+# ============================================================================
+#  Batch initiation endpoint  (unchanged)
+# ============================================================================
 @upload_bp.route('/initiate-batch', methods=['POST', 'OPTIONS'])
 @jwt_required(optional=True)
 def initiate_batch_upload():
     if request.method == 'OPTIONS':
         return make_response(("OK", 200))
-
+    # ... (body unchanged for brevity)
     batch_id = str(uuid.uuid4())
     log_prefix = f"[BatchInitiate-{batch_id}]"
-
+    # (rest of code remains identical to earlier version)
+    # -----------------------------------------------------------------------
     user_info = {"is_anonymous": True, "username": "Anonymous", "user_email": None}
     identity = get_jwt_identity()
     if identity:
